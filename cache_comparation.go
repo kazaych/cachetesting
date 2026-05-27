@@ -62,20 +62,26 @@ limitations under the License.
 //
 // # Run
 //
-//	make setup-envtest   # once — downloads kube-apiserver + etcd binaries
-//	make cache-comparison
+//	make setup-envtest   # once - downloads kube-apiserver + etcd binaries
+//	make test
 //
 // Or directly:
 //
 //	KUBEBUILDER_ASSETS=... go test ./pkg/reconcilers/... \
 //	    -run TestCacheComparison -v -count=1 -timeout 600s
-package reconcilers_test
+package cachecomparison
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -99,8 +105,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-
-	"fox.flant.com/team/managed-services/managed-kafka/managed-kafka-operator/pkg/constants"
 )
 
 // ---------------------------------------------------------------------------
@@ -108,6 +112,10 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
+	// Label used by the operator to identify resources it owns.
+	managedByKey        = "managed-services.deckhouse.io/managed-by"
+	kafkaManagedByValue = "managed-kafka-operator"
+
 	// Namespaces that simulate other teams sharing the cluster.
 	otherNamespaceCount = 50
 	podsPerOtherNs      = 100 // per namespace → 50 × 100 = 5000 "other" pods
@@ -117,9 +125,9 @@ const (
 	stsPerOtherNs       = 1   // per namespace → 50 × 1 = 50 "other" StatefulSets
 
 	// Kafka resources — what the operator actually manages.
-	kafkaNs           = "kafka-production"
-	kafkaInstances    = 3 // number of Kafka CRs (one StatefulSet each)
-	brokersPerKafka   = 3 // broker pods per Kafka instance
+	kafkaNs         = "kafka-production"
+	kafkaInstances  = 3 // number of Kafka CRs (one StatefulSet each)
+	brokersPerKafka = 3 // broker pods per Kafka instance
 	// Totals: 9 kafka pods, 3 kafka services, 3 kafka StatefulSets
 )
 
@@ -168,7 +176,7 @@ type apiCounter struct {
 	totalWatch atomic.Int64
 }
 
-func (c *apiCounter) addListReq(req *http.Request) { c.listReqs.add(req, 1); c.totalList.Add(1) }
+func (c *apiCounter) addListReq(req *http.Request)  { c.listReqs.add(req, 1); c.totalList.Add(1) }
 func (c *apiCounter) addWatchReq(req *http.Request) { c.watchReqs.add(req, 1); c.totalWatch.Add(1) }
 
 // countingBody wraps an io.ReadCloser and accumulates byte counts.
@@ -332,14 +340,14 @@ func runScenario(t *testing.T, name string, baseCfg *rest.Config, withLabels boo
 	var cacheOpts cache.Options
 	if withLabels {
 		sel := k8slabels.SelectorFromSet(k8slabels.Set{
-			constants.ManagedByKey: constants.KafkaManagedByValue,
+			managedByKey: kafkaManagedByValue,
 		})
 		byObj := cache.ByObject{Label: sel}
 		cacheOpts = cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
 				&corev1.Pod{}:                   byObj,
 				&corev1.Service{}:               byObj,
-				&appsv1.StatefulSet{}:            byObj,
+				&appsv1.StatefulSet{}:           byObj,
 				&corev1.Secret{}:                byObj,
 				&corev1.PersistentVolumeClaim{}: byObj,
 			},
@@ -368,7 +376,7 @@ func runScenario(t *testing.T, name string, baseCfg *rest.Config, withLabels boo
 
 	// t=0 anchor sample — guarantees ≥2 points even for very fast syncs.
 	var (
-		samples   = []initSample{{
+		samples = []initSample{{
 			elapsed:    0,
 			heapKiB:    0, // Start at 0 for relative delta
 			apiTotal:   0,
@@ -442,7 +450,7 @@ func runScenario(t *testing.T, name string, baseCfg *rest.Config, withLabels boo
 		var pl corev1.PodList
 		_ = mgr.GetClient().List(ctx, &pl,
 			client.InNamespace(kafkaNs),
-			client.MatchingLabels{constants.ManagedByKey: constants.KafkaManagedByValue},
+			client.MatchingLabels{managedByKey: kafkaManagedByValue},
 		)
 	}
 	avgLatency := time.Since(listStart) / listRuns
@@ -680,7 +688,7 @@ func svgChart(title, xLabel, yLabel string, series []svgSeries) string {
 	fmt.Fprintf(&b, `<text x="%d" y="%d" text-anchor="middle" font-size="10" fill="#495057">%s</text>`,
 		svgPadL+svgW/2, svgPadT+svgH+28, htmlEscape(xLabel))
 	fmt.Fprintf(&b, `<text transform="rotate(-90)" x="%d" y="%d" text-anchor="middle" font-size="10" fill="#495057">%s</text>`,
-		-(svgPadT+svgH/2), 12, htmlEscape(yLabel))
+		-(svgPadT + svgH/2), 12, htmlEscape(yLabel))
 
 	// Series
 	for _, s := range series {
@@ -852,9 +860,9 @@ code{background:#f1f3f5;padding:1px 5px;border-radius:3px;font-size:12px}
 
 	// Bar charts
 	type barMetric struct {
-		title    string
+		title      string
 		valA, valB float64
-		unit     string
+		unit       string
 	}
 	barMetrics := []barMetric{
 		{"Подов в кэше", float64(a.cached.pods), float64(b.cached.pods), "pods"},
@@ -908,10 +916,10 @@ code{background:#f1f3f5;padding:1px 5px;border-radius:3px;font-size:12px}
 	fmt.Fprintf(&sb, `<tr><th>Metric</th><th>%s</th><th class="bad-col">⚠️ %s</th><th>Снижение</th></tr>`,
 		htmlEscape(shortName(a.name)), htmlEscape(shortName(b.name)))
 	tableRows := []struct {
-		label    string
-		va, vb   string
-		pct      float64
-		isSep    bool
+		label  string
+		va, vb string
+		pct    float64
+		isSep  bool
 	}{
 		{"[Объекты в кэше]", "", "", 0, true},
 		{"Поды", fmt.Sprintf("%d", a.cached.pods), fmt.Sprintf("%d", b.cached.pods),
@@ -1019,8 +1027,8 @@ func seedCluster(t *testing.T, ctx context.Context, c client.Client) {
 		for b := range brokersPerKafka {
 			jobs <- job{pod(fmt.Sprintf("%s-%d", stsName, b), kafkaNs,
 				map[string]string{
-					constants.ManagedByKey: constants.KafkaManagedByValue,
-					"app":                  "kafka",
+					managedByKey:                         kafkaManagedByValue,
+					"app":                                "kafka",
 					"statefulset.kubernetes.io/pod-name": fmt.Sprintf("%s-%d", stsName, b),
 				})}
 		}
@@ -1113,9 +1121,9 @@ func pod(name, namespace string, labels map[string]string) *corev1.Pod {
 
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name, 
-			Namespace: namespace, 
-			Labels: labels,
+			Name:      name,
+			Namespace: namespace,
+			Labels:    labels,
 			Annotations: map[string]string{
 				"dummy-annotation-1": strings.Repeat("val", 50),
 				"dummy-annotation-2": strings.Repeat("val", 50),
@@ -1125,18 +1133,18 @@ func pod(name, namespace string, labels map[string]string) *corev1.Pod {
 		Spec: corev1.PodSpec{
 			InitContainers: []corev1.Container{
 				{
-					Name:  "init-1",
-					Image: "busybox:1.36",
-					Command: []string{"sh", "-c", "echo init"},
-					Env: envs[:10],
+					Name:         "init-1",
+					Image:        "busybox:1.36",
+					Command:      []string{"sh", "-c", "echo init"},
+					Env:          envs[:10],
 					VolumeMounts: mounts[:5],
 				},
 			},
 			Containers: []corev1.Container{
 				{
-					Name:  "main", 
-					Image: "pause:3.9",
-					Env:   envs,
+					Name:         "main",
+					Image:        "pause:3.9",
+					Env:          envs,
 					VolumeMounts: mounts,
 					Resources: corev1.ResourceRequirements{
 						Requests: corev1.ResourceList{
@@ -1150,9 +1158,9 @@ func pod(name, namespace string, labels map[string]string) *corev1.Pod {
 					},
 				},
 				{
-					Name:  "sidecar", 
-					Image: "fluentd:latest",
-					Env:   envs[:20],
+					Name:         "sidecar",
+					Image:        "fluentd:latest",
+					Env:          envs[:20],
 					VolumeMounts: mounts,
 				},
 			},
@@ -1184,8 +1192,8 @@ func labeledSTS(name, namespace string, replicas int32) *appsv1.StatefulSet {
 			Name:      name,
 			Namespace: namespace,
 			Labels: map[string]string{
-				constants.ManagedByKey: constants.KafkaManagedByValue,
-				"app":                  "kafka",
+				managedByKey: kafkaManagedByValue,
+				"app":        "kafka",
 			},
 		},
 		Spec: appsv1.StatefulSetSpec{
@@ -1207,8 +1215,8 @@ func labeledSvc(name, namespace string) *corev1.Service {
 			Name:      name,
 			Namespace: namespace,
 			Labels: map[string]string{
-				constants.ManagedByKey: constants.KafkaManagedByValue,
-				"app":                  "kafka",
+				managedByKey: kafkaManagedByValue,
+				"app":        "kafka",
 			},
 		},
 		Spec: corev1.ServiceSpec{
@@ -1245,13 +1253,21 @@ func plainSvc(name, namespace string) *corev1.Service {
 	}
 }
 
+var (
+	tlsDataOnce sync.Once
+	tlsCertPEM  []byte
+	tlsKeyPEM   []byte
+	tlsDataErr  error
+)
+
 func secret(name, namespace string, labels map[string]string) *corev1.Secret {
-	// Make the secret larger and simulate a TLS secret
+	certPEM, keyPEM := testTLSData()
+
+	// Make the secret larger and simulate a realistic TLS secret.
 	data := make(map[string][]byte)
-	// Simulate a 4KB cert and 2KB key
-	data[corev1.TLSCertKey] = []byte(strings.Repeat("c", 4096))
-	data[corev1.TLSPrivateKeyKey] = []byte(strings.Repeat("k", 2048))
-	
+	data[corev1.TLSCertKey] = certPEM
+	data[corev1.TLSPrivateKeyKey] = keyPEM
+
 	// Add some extra data just to inflate it more
 	for i := 0; i < 5; i++ {
 		data[fmt.Sprintf("extra-key-%d", i)] = []byte(strings.Repeat("a", 2048))
@@ -1262,6 +1278,34 @@ func secret(name, namespace string, labels map[string]string) *corev1.Secret {
 		Type:       corev1.SecretTypeTLS,
 		Data:       data,
 	}
+}
+
+func testTLSData() ([]byte, []byte) {
+	tlsDataOnce.Do(func() {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			tlsDataErr = err
+			return
+		}
+		template := x509.Certificate{
+			SerialNumber: big.NewInt(1),
+			Subject:      pkix.Name{CommonName: "cache-comparison.test"},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(24 * time.Hour),
+			KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		}
+		certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+		if err != nil {
+			tlsDataErr = err
+			return
+		}
+		tlsCertPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+		tlsKeyPEM = pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	})
+	if tlsDataErr != nil {
+		panic(fmt.Sprintf("generate test TLS data: %v", tlsDataErr))
+	}
+	return tlsCertPEM, tlsKeyPEM
 }
 
 func pvc(name, namespace string, labels map[string]string) *corev1.PersistentVolumeClaim {
@@ -1279,7 +1323,7 @@ func pvc(name, namespace string, labels map[string]string) *corev1.PersistentVol
 }
 
 func findEnvtestBinDir() string {
-	basePath := filepath.Join("..", "..", "bin", "k8s")
+	basePath := filepath.Join("bin", "k8s")
 	entries, err := os.ReadDir(basePath)
 	if err != nil {
 		return ""
